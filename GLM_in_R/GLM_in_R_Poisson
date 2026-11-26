@@ -155,3 +155,4 @@ Beta_Optimizer = function(Independent_Variable_Matrix, Exposure_Vector, Observat
     coefficients = Beta_Estimate,
     history = Beta_History)
 
+#Now we can test our GLM against the standard R stats package!

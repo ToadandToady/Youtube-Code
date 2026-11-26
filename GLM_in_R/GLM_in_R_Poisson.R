@@ -1,0 +1,158 @@
+library(tidyverse)
+
+install.packages(c("xts", "zoo"))
+install.packages("CASdatasets", repos = "http://dutangc.free.fr/pub/RRepos/pub/", type="source")
+
+
+library(CASdatasets)
+
+view(usworkcomp)
+summary(usworkcomp) #CL is occupation class, YR is year, PR is Payroll, Loss is what it sounds like
+
+data(fremotor2freq9907b)
+data(fremotor3freq9907b)
+data(fremotor4freq9907b)
+
+freq = bind_rows(fremotor2freq9907b,
+                 fremotor3freq9907b,
+                 fremotor4freq9907b)
+
+freq |> 
+  filter(
+    is.na(Year) |
+      is.na(Usage) |
+      is.na(VehType) |
+      is.na(VehPower) |
+      is.na(Expo) |
+      is.na(NbClaim)
+  ) #just making sure
+
+#Weighted Regression Time
+#Some logic: what I would like to do is iteratively find my beta parameters. If I had the inverse of my 
+#fisher information matrix (really my design matrix), then 
+#I could simply multiply it by my explanatory variables matrix, my weight matrix, and my response vector. Thus I need by wishful thinking:
+
+Beta_New_Sketch = function(I_Inv, Explanatory_Matrix, Weight_Matrix, Response_Vector){
+  I_Inv %*% Explanatory_Matrix %*% Weight_Matrix %*% Response_Vector
+}
+
+#Now, I likely already have the ability to create my explanatory matrix from the data, as well as the exposures and observations:
+glimpse(freq)
+Explanatory = freq |> 
+  mutate(Year_Numeric_Trend = as.numeric(as.character(Year)) - 1999) |> 
+  select(Usage, VehType, VehPower, Year_Numeric_Trend)
+Exposure = freq |>
+  pull(Expo)
+Observations = freq |>
+  pull(NbClaim)
+
+#Next, we'll have to split all our categorical variables into individual dummy variables (minus one).
+Explanatory = model.matrix(
+  ~ VehType + Usage + VehPower + Year_Numeric_Trend,
+  data = Explanatory
+)
+
+#We'll build the Weight_Matrix next
+Weight_Matrix_That_Is_Actually_A_Vector_For_Space_Concerns = function(Variance_Structure_Vector){
+  as.vector(Variance_Structure_Vector)
+}
+
+#Then the Variance Structure function for a poisson random variable which is just estimating mu
+Poisson_Variance_Structure = function(Prediction_Vector, Exposure_Vector){
+  Exposure_Vector * exp(Prediction_Vector)
+}
+
+#More broadly, given some link function, we would estimate mu like so:
+mu_estimator = function(Prediction_Vector, Exposure_Vector, link_function){
+  Exposure_Vector * link_function(Prediction_Vector)
+}
+
+#Finally the prediction Vector that is computed every iteration
+Prediction_Vector = function(Explanatory_Matrix, Beta_Vector){
+  as.vector(Explanatory_Matrix %*% Beta_Vector)
+}
+
+#To inverse the Fisher Information Matrix efficiently, we'll use Cholesky decomposition, then forward and backward sub to solve
+Cholesky_Decomposer = function(Fisher_Matrix){
+  m = ncol(Fisher_Matrix)
+  Cholesky_Matrix = matrix(0, m, m)
+  
+  for(i in seq_len(m)){
+    k = seq_len(i-1)
+    Cholesky_Matrix[i,i] = sqrt(Fisher_Matrix[i,i] - sum(Cholesky_Matrix[k,i]^2))
+    
+    if(i < m) {
+      for(j in seq(i + 1, m)) {
+        Cholesky_Matrix[i,j] = (Fisher_Matrix[i,j] - sum(Cholesky_Matrix[k, i] * Cholesky_Matrix[k, j])) / Cholesky_Matrix[i,i]
+      }
+    }
+  }
+  Cholesky_Matrix #Upper
+}
+
+#Our Fisher Information Matrix then needs to be built as well
+Fisherize = function(Explanatory_Matrix, Weight_Vector) {
+  t(Explanatory_Matrix) %*% (Weight_Vector * Explanatory_Matrix)
+}
+
+#We need our right hand side vector as well. Note that for the Poisson distribution, our mu vector and variance structure vector are identical
+RHS = function(Explanatory_Matrix, Beta_Vector, Observation_Vector, mu_Vector, Variance_Structure_Vector) {
+  Response_Vector = Explanatory_Matrix %*% Beta_Vector + (Observation_Vector - mu_Vector) / Variance_Structure_Vector
+  t(Explanatory_Matrix) %*% (Variance_Structure_Vector * Response_Vector)
+}
+
+#Finally, we can implement our forward and backward substitution method to solve our system of equations
+Forward_Sub_Solve = function(U, r) {
+  U_t = t(U)
+  m = ncol(U)
+  output_vector = numeric(m)
+  
+  for(i in seq_len(m)) {
+    k = seq_len(i-1)
+    output_vector[i] = (r[i] - sum(U_t[i,k] * output_vector[k])) / U_t[i,i]
+  }
+  output_vector
+}
+
+Backward_Sub_Solve = function(U, vector) {
+  m = ncol(U)
+  Beta_New = numeric(m)
+  
+  for(i in rev(seq_len(m))) {
+    k = i + seq_len(m-i)
+    Beta_New[i] = (vector[i] - sum(U[i,k] * Beta_New[k])) / U[i,i]
+  }
+  Beta_New
+}
+
+#Now I can finally implement my procedure to take a data set and spit out my optimized beta parameters!
+Beta_Optimizer = function(Independent_Variable_Matrix, Exposure_Vector, Observation_Vector, Variance_Structure_Function, link_function){
+  Beta_Estimate = numeric(ncol(Independent_Variable_Matrix))
+  change_in_beta = 1
+  tolerance = 1e-8
+  Beta_History = matrix(Beta_Estimate, nrow = 1)
+  colnames(Beta_History) = colnames(Independent_Variable_Matrix)
+  while(change_in_beta > tolerance) {
+    predictions = Prediction_Vector(Independent_Variable_Matrix,
+                                    Beta_Estimate)
+    mu_Vector = mu_estimator(predictions, Exposure_Vector, link_function)
+    variance_structure_Vector = Variance_Structure_Function(predictions, Exposure_Vector)
+    r = RHS(Independent_Variable_Matrix, Beta_Estimate, Observation_Vector, mu_Vector, variance_structure_Vector)
+    U = Cholesky_Decomposer(
+      Fisherize(
+        Independent_Variable_Matrix,
+        variance_structure_Vector
+        ))
+    Beta_New = Backward_Sub_Solve(
+      U,
+      Forward_Sub_Solve(U, r)
+    )
+    change_in_beta = max(abs(Beta_New - Beta_Estimate) / (1 + abs(Beta_Estimate)))
+    Beta_Estimate = Beta_New
+    Beta_History = rbind(Beta_History, Beta_Estimate)
+  }
+  list(
+    coefficients = Beta_Estimate,
+    history = Beta_History)
+
+#Now we can test our GLM against the standard R stats package!
